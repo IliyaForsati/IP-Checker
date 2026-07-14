@@ -1,0 +1,19 @@
+[Unit]
+Description=IP Checker - domain to IP enforcement daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipcheckerd -config /etc/ip-checker/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=-/usr/sbin/nft delete table inet ipchecker
+Restart=on-failure
+RestartSec=2
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

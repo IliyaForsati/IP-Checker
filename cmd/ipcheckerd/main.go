@@ -79,6 +79,7 @@ func main() {
 	tlsPipeline := sniobserver.NewPipeline(engine, flows, correlation)
 
 	go sweepLoop(ctx, flows, correlation)
+	go reloadLoop(ctx, *configPath, logger, engine)
 
 	errHandler := func(e error) int {
 		logger.Warn("nfqueue error", "error", e)
@@ -201,6 +202,32 @@ func sweepLoop(ctx context.Context, flows *decision.FlowTable, correlation *dnso
 		case now := <-ticker.C:
 			flows.Sweep(now)
 			correlation.Sweep(now)
+		}
+	}
+}
+
+func reloadLoop(ctx context.Context, configPath string, logger *slog.Logger, engine *decision.Engine) {
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, syscall.SIGHUP)
+	defer signal.Stop(reloadCh)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-reloadCh:
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				logger.Error("config reload failed, keeping previous config", "error", err)
+				continue
+			}
+			matcher, err := cfg.BuildMatcher()
+			if err != nil {
+				logger.Error("config reload failed, keeping previous config", "error", err)
+				continue
+			}
+			engine.SetState(matcher, cfg.EnforcementMode == config.EnforcementModeMonitor)
+			logger.Info("config reloaded", "path", configPath, "enforcement_mode", cfg.EnforcementMode, "domains", len(cfg.Domains))
 		}
 	}
 }

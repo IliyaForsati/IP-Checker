@@ -3,6 +3,7 @@ package decision
 import (
 	"log/slog"
 	"net"
+	"sync/atomic"
 
 	"github.com/IliyaForsati/IP-Checker/internal/cidr"
 )
@@ -21,14 +22,24 @@ func (v Verdict) String() string {
 	return "accept"
 }
 
-type Engine struct {
+type engineState struct {
 	matcher     *cidr.Matcher
-	logger      *slog.Logger
 	monitorOnly bool
 }
 
+type Engine struct {
+	logger *slog.Logger
+	state  atomic.Pointer[engineState]
+}
+
 func NewEngine(matcher *cidr.Matcher, logger *slog.Logger, monitorOnly bool) *Engine {
-	return &Engine{matcher: matcher, logger: logger, monitorOnly: monitorOnly}
+	e := &Engine{logger: logger}
+	e.SetState(matcher, monitorOnly)
+	return e
+}
+
+func (e *Engine) SetState(matcher *cidr.Matcher, monitorOnly bool) {
+	e.state.Store(&engineState{matcher: matcher, monitorOnly: monitorOnly})
 }
 
 func (e *Engine) EvaluateSNI(dstIP net.IP, dstPort uint16, sni string) Verdict {
@@ -38,7 +49,8 @@ func (e *Engine) EvaluateSNI(dstIP net.IP, dstPort uint16, sni string) Verdict {
 		return VerdictAccept
 	}
 
-	rule, matched := e.matcher.Match(sni)
+	state := e.state.Load()
+	rule, matched := state.matcher.Match(sni)
 	if !matched {
 		e.logger.Warn("passthrough: domain not present in config, unmonitored",
 			"event", "passthrough_unmonitored", "domain", sni, "dst_ip", dstIP.String(), "dst_port", dstPort)
@@ -54,16 +66,17 @@ func (e *Engine) EvaluateSNI(dstIP net.IP, dstPort uint16, sni string) Verdict {
 	e.logger.Warn("blocked connection: destination IP outside allowed range",
 		"event", "block", "domain", sni, "matched_rule", rule.Domain,
 		"dst_ip", dstIP.String(), "dst_port", dstPort, "reason", "ip_not_in_allowed_cidrs",
-		"monitor_only", e.monitorOnly)
+		"monitor_only", state.monitorOnly)
 
-	if e.monitorOnly {
+	if state.monitorOnly {
 		return VerdictAccept
 	}
 	return VerdictDrop
 }
 
 func (e *Engine) EvaluateDNSAnswer(domain string, ip net.IP) {
-	rule, matched := e.matcher.Match(domain)
+	state := e.state.Load()
+	rule, matched := state.matcher.Match(domain)
 	if !matched {
 		return
 	}
@@ -75,7 +88,8 @@ func (e *Engine) EvaluateDNSAnswer(domain string, ip net.IP) {
 }
 
 func (e *Engine) EvaluateNewSYN(dstIP net.IP, dstPort uint16, domain string) Verdict {
-	rule, matched := e.matcher.Match(domain)
+	state := e.state.Load()
+	rule, matched := state.matcher.Match(domain)
 	if !matched {
 		return VerdictAccept
 	}
@@ -86,9 +100,9 @@ func (e *Engine) EvaluateNewSYN(dstIP net.IP, dstPort uint16, domain string) Ver
 	e.logger.Warn("blocked SYN preemptively via DNS correlation",
 		"event", "block_syn_preemptive", "domain", domain, "matched_rule", rule.Domain,
 		"dst_ip", dstIP.String(), "dst_port", dstPort, "reason", "ip_not_in_allowed_cidrs",
-		"monitor_only", e.monitorOnly)
+		"monitor_only", state.monitorOnly)
 
-	if e.monitorOnly {
+	if state.monitorOnly {
 		return VerdictAccept
 	}
 	return VerdictDrop
