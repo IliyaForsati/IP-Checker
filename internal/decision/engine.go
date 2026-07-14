@@ -61,3 +61,35 @@ func (e *Engine) EvaluateSNI(dstIP net.IP, dstPort uint16, sni string) Verdict {
 	}
 	return VerdictDrop
 }
+
+func (e *Engine) EvaluateDNSAnswer(domain string, ip net.IP) {
+	rule, matched := e.matcher.Match(domain)
+	if !matched {
+		return
+	}
+	if rule.Allows(ip) {
+		return
+	}
+	e.logger.Warn("dns pre-check: configured domain resolved outside allowed CIDRs",
+		"event", "dns_resolution_outside_allowed", "domain", domain, "matched_rule", rule.Domain, "resolved_ip", ip.String())
+}
+
+func (e *Engine) EvaluateNewSYN(dstIP net.IP, dstPort uint16, domain string) Verdict {
+	rule, matched := e.matcher.Match(domain)
+	if !matched {
+		return VerdictAccept
+	}
+	if rule.Allows(dstIP) {
+		return VerdictAccept
+	}
+
+	e.logger.Warn("blocked SYN preemptively via DNS correlation",
+		"event", "block_syn_preemptive", "domain", domain, "matched_rule", rule.Domain,
+		"dst_ip", dstIP.String(), "dst_port", dstPort, "reason", "ip_not_in_allowed_cidrs",
+		"monitor_only", e.monitorOnly)
+
+	if e.monitorOnly {
+		return VerdictAccept
+	}
+	return VerdictDrop
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/IliyaForsati/IP-Checker/internal/cidr"
 	"github.com/IliyaForsati/IP-Checker/internal/decision"
+	"github.com/IliyaForsati/IP-Checker/internal/dnsobserver"
 	"github.com/IliyaForsati/IP-Checker/internal/packet"
 )
 
@@ -55,7 +56,8 @@ func testPipeline(t *testing.T, allowedCIDR, domain string, monitorOnly bool) *P
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	engine := decision.NewEngine(matcher, logger, monitorOnly)
 	flows := decision.NewFlowTable(time.Minute)
-	return NewPipeline(engine, flows)
+	correlation := dnsobserver.NewTable(time.Minute)
+	return NewPipeline(engine, flows, correlation)
 }
 
 func TestPipeline_AllowsConfiguredDomainWithAllowedIP(t *testing.T) {
@@ -115,6 +117,26 @@ func TestPipeline_AcceptsBareSYNWithoutPayload(t *testing.T) {
 
 	if v := p.HandleIPv4(ip); v != decision.VerdictAccept {
 		t.Fatalf("expected Accept for bare SYN with no payload yet, got %v", v)
+	}
+}
+
+func TestPipeline_DropsSYNPreemptivelyViaDNSCorrelation(t *testing.T) {
+	_, allowedNet, err := net.ParseCIDR("104.16.0.0/13")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	matcher := cidr.NewMatcher([]cidr.Rule{{Domain: "leaktest.local", Nets: []*net.IPNet{allowedNet}}})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	engine := decision.NewEngine(matcher, logger, false)
+	flows := decision.NewFlowTable(time.Minute)
+	correlation := dnsobserver.NewTable(time.Minute)
+	correlation.Record("leaktest.local", net.ParseIP("8.8.8.8"), time.Minute)
+	p := NewPipeline(engine, flows, correlation)
+
+	syn := buildIPv4TCPPacket(t, net.ParseIP("10.0.0.5"), net.ParseIP("8.8.8.8"), 51000, 443, 1, packet.TCPFlagSYN, nil)
+
+	if v := p.HandleIPv4(syn); v != decision.VerdictDrop {
+		t.Fatalf("expected Drop on SYN itself via DNS correlation, got %v", v)
 	}
 }
 

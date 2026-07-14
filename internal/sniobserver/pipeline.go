@@ -2,6 +2,7 @@ package sniobserver
 
 import (
 	"github.com/IliyaForsati/IP-Checker/internal/decision"
+	"github.com/IliyaForsati/IP-Checker/internal/dnsobserver"
 	"github.com/IliyaForsati/IP-Checker/internal/packet"
 )
 
@@ -9,13 +10,15 @@ type Pipeline struct {
 	engine      *decision.Engine
 	flows       *decision.FlowTable
 	reassembler *Reassembler
+	correlation *dnsobserver.Table
 }
 
-func NewPipeline(engine *decision.Engine, flows *decision.FlowTable) *Pipeline {
+func NewPipeline(engine *decision.Engine, flows *decision.FlowTable, correlation *dnsobserver.Table) *Pipeline {
 	return &Pipeline{
 		engine:      engine,
 		flows:       flows,
 		reassembler: NewReassembler(),
+		correlation: correlation,
 	}
 }
 
@@ -29,6 +32,15 @@ func (p *Pipeline) HandleIPv4(ip *packet.IPv4) decision.Verdict {
 
 	if verdict, ok := p.flows.Get(key); ok {
 		return verdict
+	}
+
+	if seg.HasFlag(packet.TCPFlagSYN) && p.correlation != nil {
+		if domain, ok := p.correlation.Lookup(ip.DstIP); ok {
+			if verdict := p.engine.EvaluateNewSYN(ip.DstIP, seg.DstPort, domain); verdict == decision.VerdictDrop {
+				p.flows.Set(key, verdict)
+				return verdict
+			}
+		}
 	}
 
 	if seg.HasFlag(packet.TCPFlagFIN) || seg.HasFlag(packet.TCPFlagRST) {

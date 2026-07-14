@@ -15,6 +15,7 @@ import (
 
 	"github.com/IliyaForsati/IP-Checker/internal/config"
 	"github.com/IliyaForsati/IP-Checker/internal/decision"
+	"github.com/IliyaForsati/IP-Checker/internal/dnsobserver"
 	"github.com/IliyaForsati/IP-Checker/internal/logging"
 	"github.com/IliyaForsati/IP-Checker/internal/nft"
 	"github.com/IliyaForsati/IP-Checker/internal/packet"
@@ -73,21 +74,23 @@ func main() {
 	monitorOnly := cfg.EnforcementMode == config.EnforcementModeMonitor
 	engine := decision.NewEngine(matcher, logger, monitorOnly)
 	flows := decision.NewFlowTable(time.Duration(cfg.FlowVerdictTTLSeconds) * time.Second)
-	pipeline := sniobserver.NewPipeline(engine, flows)
+	correlation := dnsobserver.NewTable(time.Duration(cfg.DNSCorrelationTTLSeconds) * time.Second)
+	dnsPipeline := dnsobserver.NewPipeline(correlation, engine)
+	tlsPipeline := sniobserver.NewPipeline(engine, flows, correlation)
 
-	go sweepLoop(ctx, flows)
+	go sweepLoop(ctx, flows, correlation)
 
 	errHandler := func(e error) int {
 		logger.Warn("nfqueue error", "error", e)
 		return 0
 	}
 
-	if err := dnsQueue.RegisterWithErrorFunc(ctx, acceptAndLogHandler(dnsQueue, "dns", logger), errHandler); err != nil {
+	if err := dnsQueue.RegisterWithErrorFunc(ctx, dnsObserveHandler(dnsQueue, logger, dnsPipeline), errHandler); err != nil {
 		logger.Error("failed to register dns queue handler", "error", err)
 		teardown(logger)
 		os.Exit(1)
 	}
-	if err := tlsQueue.RegisterWithErrorFunc(ctx, tlsEnforceHandler(tlsQueue, logger, pipeline), errHandler); err != nil {
+	if err := tlsQueue.RegisterWithErrorFunc(ctx, tlsEnforceHandler(tlsQueue, logger, tlsPipeline), errHandler); err != nil {
 		logger.Error("failed to register tls queue handler", "error", err)
 		teardown(logger)
 		os.Exit(1)
@@ -110,7 +113,7 @@ func openQueue(queueNum uint16) (*nfqueue.Nfqueue, error) {
 	})
 }
 
-func acceptAndLogHandler(nf *nfqueue.Nfqueue, queueLabel string, logger *slog.Logger) nfqueue.HookFunc {
+func dnsObserveHandler(nf *nfqueue.Nfqueue, logger *slog.Logger, pipeline *dnsobserver.Pipeline) nfqueue.HookFunc {
 	return func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -118,11 +121,14 @@ func acceptAndLogHandler(nf *nfqueue.Nfqueue, queueLabel string, logger *slog.Lo
 		id := *a.PacketID
 
 		if a.Payload != nil {
-			logPacket(logger, queueLabel, *a.Payload)
+			logPacket(logger, "dns", *a.Payload)
+			if ip, err := packet.ParseIPv4(*a.Payload); err == nil {
+				pipeline.HandleIPv4(ip)
+			}
 		}
 
 		if err := nf.SetVerdict(id, nfqueue.NfAccept); err != nil {
-			logger.Warn("set verdict failed", "queue", queueLabel, "error", err)
+			logger.Warn("set verdict failed", "queue", "dns", "error", err)
 		}
 		return 0
 	}
@@ -185,7 +191,7 @@ func logPacket(logger *slog.Logger, queueLabel string, raw []byte) {
 	}
 }
 
-func sweepLoop(ctx context.Context, flows *decision.FlowTable) {
+func sweepLoop(ctx context.Context, flows *decision.FlowTable, correlation *dnsobserver.Table) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -194,6 +200,7 @@ func sweepLoop(ctx context.Context, flows *decision.FlowTable) {
 			return
 		case now := <-ticker.C:
 			flows.Sweep(now)
+			correlation.Sweep(now)
 		}
 	}
 }
