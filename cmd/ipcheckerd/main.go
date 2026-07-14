@@ -8,14 +8,17 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	nfqueue "github.com/florianl/go-nfqueue/v2"
 	"golang.org/x/sys/unix"
 
 	"github.com/IliyaForsati/IP-Checker/internal/config"
+	"github.com/IliyaForsati/IP-Checker/internal/decision"
 	"github.com/IliyaForsati/IP-Checker/internal/logging"
 	"github.com/IliyaForsati/IP-Checker/internal/nft"
 	"github.com/IliyaForsati/IP-Checker/internal/packet"
+	"github.com/IliyaForsati/IP-Checker/internal/sniobserver"
 )
 
 func main() {
@@ -28,7 +31,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if _, err := cfg.BuildMatcher(); err != nil {
+	matcher, err := cfg.BuildMatcher()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ipcheckerd: %v\n", err)
 		os.Exit(1)
 	}
@@ -66,6 +70,13 @@ func main() {
 	}
 	defer tlsQueue.Close()
 
+	monitorOnly := cfg.EnforcementMode == config.EnforcementModeMonitor
+	engine := decision.NewEngine(matcher, logger, monitorOnly)
+	flows := decision.NewFlowTable(time.Duration(cfg.FlowVerdictTTLSeconds) * time.Second)
+	pipeline := sniobserver.NewPipeline(engine, flows)
+
+	go sweepLoop(ctx, flows)
+
 	errHandler := func(e error) int {
 		logger.Warn("nfqueue error", "error", e)
 		return 0
@@ -76,7 +87,7 @@ func main() {
 		teardown(logger)
 		os.Exit(1)
 	}
-	if err := tlsQueue.RegisterWithErrorFunc(ctx, acceptAndLogHandler(tlsQueue, "tls", logger), errHandler); err != nil {
+	if err := tlsQueue.RegisterWithErrorFunc(ctx, tlsEnforceHandler(tlsQueue, logger, pipeline), errHandler); err != nil {
 		logger.Error("failed to register tls queue handler", "error", err)
 		teardown(logger)
 		os.Exit(1)
@@ -117,6 +128,31 @@ func acceptAndLogHandler(nf *nfqueue.Nfqueue, queueLabel string, logger *slog.Lo
 	}
 }
 
+func tlsEnforceHandler(nf *nfqueue.Nfqueue, logger *slog.Logger, pipeline *sniobserver.Pipeline) nfqueue.HookFunc {
+	return func(a nfqueue.Attribute) int {
+		if a.PacketID == nil {
+			return 0
+		}
+		id := *a.PacketID
+
+		verdict := nfqueue.NfAccept
+		if a.Payload != nil {
+			if ip, err := packet.ParseIPv4(*a.Payload); err == nil {
+				if pipeline.HandleIPv4(ip) == decision.VerdictDrop {
+					verdict = nfqueue.NfDrop
+				}
+			} else {
+				logger.Debug("non-ipv4 packet on tls queue", "error", err)
+			}
+		}
+
+		if err := nf.SetVerdict(id, verdict); err != nil {
+			logger.Warn("set verdict failed", "queue", "tls", "error", err)
+		}
+		return 0
+	}
+}
+
 func logPacket(logger *slog.Logger, queueLabel string, raw []byte) {
 	ip, err := packet.ParseIPv4(raw)
 	if err != nil {
@@ -146,6 +182,19 @@ func logPacket(logger *slog.Logger, queueLabel string, raw []byte) {
 			"queue", queueLabel,
 			"src_ip", ip.SrcIP.String(), "dst_ip", ip.DstIP.String(),
 			"src_port", dgram.SrcPort, "dst_port", dgram.DstPort)
+	}
+}
+
+func sweepLoop(ctx context.Context, flows *decision.FlowTable) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			flows.Sweep(now)
+		}
 	}
 }
 
